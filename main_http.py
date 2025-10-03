@@ -2,16 +2,47 @@ import telebot
 from telebot import types
 import yt_dlp
 import os
+import re
+import threading
+import http.server
+import socketserver
 from dotenv import load_dotenv
 
 load_dotenv()
 # токен бота
 TOKEN = os.getenv('BOT_TOKEN')
-
 bot = telebot.TeleBot(TOKEN)
 
-# временное хранилище для данных пользователей
 user_data = {}
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# ========== Мини веб-сервер для раздачи файлов ==========
+PORT = 8080
+
+def start_http_server():
+    handler = http.server.SimpleHTTPRequestHandler
+    os.chdir(DOWNLOAD_DIR)
+    with socketserver.TCPServer(("", PORT), handler) as httpd:
+        print(f"HTTP сервер запущен на http://localhost:{PORT}/")
+        httpd.serve_forever()
+
+# Запускаем веб-сервер в отдельном потоке
+threading.Thread(target=start_http_server, daemon=True).start()
+
+# =======================================================
+
+def schedule_delete(path, delay=7200):
+    """Удаляет файл через delay секунд (по умолчанию 2 часа)"""
+    def _delete():
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"[AUTO] Файл удалён: {path}")
+    threading.Timer(delay, _delete).start()
+
+def sanitize_filename(name: str) -> str:
+    """Убирает недопустимые символы для имени файла"""
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 def format_duration(seconds: int) -> str:
     if not seconds:
@@ -33,16 +64,13 @@ def handle_url(message):
     url = message.text.strip()
     chat_id = message.chat.id
 
-    ### Гарантия: берём только одно видео, не плейлист
     ydl_opts = {"skip_download": True, "noplaylist": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
-    ### Если это плейлист или "entries", берём только первый элемент
-    if "entries" in info:
+    if "entries" in info:  # если плейлист — берём первый элемент
         info = info["entries"][0]
 
-    # только аудиоформаты
     formats = [
         f for f in info.get("formats", [])
         if f.get("acodec") != "none" and f.get("vcodec") == "none"
@@ -68,7 +96,7 @@ def handle_url(message):
 
     bot.send_message(chat_id, "Выбери аудиоформат:", reply_markup=markup)
 
-# обработка выбора аудио
+# выбор формата аудио
 @bot.callback_query_handler(func=lambda call: call.data.startswith("choose_"))
 def choose_audio(call):
     chat_id = call.message.chat.id
@@ -76,7 +104,6 @@ def choose_audio(call):
 
     formats = user_data[chat_id]["formats"]
     chosen_format = formats[idx]
-
     user_data[chat_id]["chosen"] = chosen_format
 
     markup = types.InlineKeyboardMarkup()
@@ -85,7 +112,7 @@ def choose_audio(call):
 
     bot.send_message(chat_id, f"Выбран ID {chosen_format['format_id']} ({chosen_format.get('abr','?')}kbps).\nТеперь выбери конечный формат файла:", reply_markup=markup)
 
-# обработка выбора конечного формата
+# выбор конечного расширения
 @bot.callback_query_handler(func=lambda call: call.data.startswith("format_"))
 def ask_quality(call):
     chat_id = call.message.chat.id
@@ -99,7 +126,7 @@ def ask_quality(call):
 
     bot.send_message(chat_id, f"Формат выбран: {ext.upper()}.\nТеперь выбери качество (битрейт):", reply_markup=markup)
 
-# обработка выбора качества
+# скачивание
 @bot.callback_query_handler(func=lambda call: call.data.startswith("quality_"))
 def download_audio(call):
     chat_id = call.message.chat.id
@@ -109,12 +136,16 @@ def download_audio(call):
     chosen_format = user_data[chat_id]["chosen"]
     ext = user_data[chat_id]["ext"]
 
-    outtmpl = f"{chat_id}_audio.%(ext)s"
+    info = user_data[chat_id]["info"]
+    title = info.get("title", "Без названия")
+    safe_title = sanitize_filename(title)
+
+    outtmpl = os.path.join(DOWNLOAD_DIR, f"{safe_title}.%(ext)s")
 
     ydl_opts = {
         "format": chosen_format["format_id"],
         "outtmpl": outtmpl,
-        "noplaylist": True,   ### гарантируем: не плейлист
+        "noplaylist": True,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": ext,
@@ -127,18 +158,22 @@ def download_audio(call):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    info = user_data[chat_id]["info"]
-    title = info.get("title", "Без названия")
+    filename = os.path.join(DOWNLOAD_DIR, f"{safe_title}.{ext}")
 
-    filename = f"{chat_id}_audio.{ext}"
+    try:
+        with open(filename, "rb") as f:
+            bot.send_document(chat_id, f, caption=title, timeout=60)
+        bot.send_message(chat_id, "Готово ✅")
+        os.remove(filename)
 
-
-
-    with open(filename, "rb") as f:
-        bot.send_document(chat_id, f, caption=title)
-
-    os.remove(filename)
-    bot.send_message(chat_id, "Готово ✅")
+    except Exception as e:
+        public_url = f"http://YOUR_SERVER_IP:{PORT}/{os.path.basename(filename)}"
+        bot.send_message(
+            chat_id,
+            f"⚠️ Не удалось отправить файл напрямую (ошибка: {e}).\n"
+            f"Скачай по ссылке (действует 2 часа):\n{public_url}"
+        )
+        schedule_delete(filename, delay=7200)
 
 
 if __name__ == "__main__":

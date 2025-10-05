@@ -7,10 +7,30 @@ import threading
 import http.server
 import socketserver
 from dotenv import load_dotenv
+from loguru import logger
+from datetime import datetime
 
 
-load_dotenv()
+# === ЛОГИРОВАНИЕ ===
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+today_log = os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y-%m-%d')}.log")
+
+logger.remove()  # убираем дефолтный вывод
+logger.add(
+    today_log,
+    rotation="00:00",          # новый файл каждый день
+    retention="7 days",        # храним неделю
+    compression="zip",         # старые архивируются
+    encoding="utf-8",
+    enqueue=True,              # потокобезопасно
+    level="INFO",
+)
+logger.add(lambda msg: print(msg, end=""), colorize=True, level="INFO")
+
+
 # токен бота
+load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 
@@ -31,6 +51,7 @@ def start_http_server():
         httpd.serve_forever()
 
 threading.Thread(target=start_http_server, daemon=True).start()
+logger.info("🤖 Bot started and HTTP server running on port {}", PORT)
 # =======================================================
 
 # словари переводов
@@ -106,7 +127,7 @@ def schedule_delete(path, delay=7200):
     def _delete():
         if os.path.exists(path):
             os.remove(path)
-            print(f"[AUTO] Файл удалён: {path}")
+            logger.info("[AUTO] File deleted: {}", path)
     threading.Timer(delay, _delete).start()
 
 def sanitize_filename(name: str) -> str:
@@ -135,6 +156,7 @@ def start(message):
             user_lang[chat_id] = "be"  # язык по умолчанию
 
     bot.send_message(chat_id, t(chat_id, "start"))
+    logger.info("User {} started bot. Language: {}", message.from_user.id, user_lang[chat_id])
 
 @bot.message_handler(commands=['language'])
 def language(message):
@@ -150,6 +172,7 @@ def set_language(call):
     chat_id = call.message.chat.id
     code = call.data.split("_")[1]
     user_lang[chat_id] = code
+    logger.info("User {} changed language to {}", chat_id, code)
     bot.send_message(chat_id, translations[code]["lang_set"])
 
 # обработка URL
@@ -157,12 +180,14 @@ def set_language(call):
 def handle_url(message):
     url = message.text.strip()
     chat_id = message.chat.id
+    logger.info("User {} sent URL: {}", chat_id, url)
 
     ydl_opts = {"skip_download": True, "noplaylist": True}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception:
+        logger.warning("Unsupported URL from {}: {}", chat_id, url)
         bot.send_message(chat_id, t(chat_id, "unsupported"))
         return
 
@@ -234,6 +259,13 @@ def download_audio(call):
     title = info.get("title", "Без названия")
     safe_title = sanitize_filename(title)
 
+    est_size = chosen_format.get("filesize") or chosen_format.get("filesize_approx")
+
+    if est_size and est_size > 20 * 1024 * 1024:  # 20 MB
+        bot.send_message(chat_id, t(chat_id, "too_big"))
+        logger.info("⚠️ Skipped too large file ({} MB) for user {}", round(est_size / 1048576, 2), chat_id)
+        return
+
     outtmpl = os.path.join(DOWNLOAD_DIR, f"{safe_title}.%(ext)s")
 
     ydl_opts = {
@@ -248,17 +280,13 @@ def download_audio(call):
     }
 
     bot.send_message(chat_id, t(chat_id, "downloading", ext=ext.upper(), q=quality))
+    logger.info("Downloading {} as {} {}kbps for user {}", title, ext, quality, chat_id)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
     filename = os.path.join(DOWNLOAD_DIR, f"{safe_title}.{ext}")
 
-    # проверяем размер итогового файла
-    if os.path.getsize(filename) > 20 * 1024 * 1024:  # 20 MB
-        bot.send_message(chat_id, t(chat_id, "too_big"))
-        os.remove(filename)
-        return
 
     try:
         with open(filename, "rb") as f:
@@ -266,6 +294,7 @@ def download_audio(call):
         bot.send_message(chat_id, t(chat_id, "done"))
         os.remove(filename)
     except Exception as e:
+        logger.error("Error sending file to {}: {}", chat_id, e)
         public_url = f"http://YOUR_SERVER_IP:{PORT}/{os.path.basename(filename)}"
         bot.send_message(chat_id, t(chat_id, "error", err=e, url=public_url))
         schedule_delete(filename, delay=7200)

@@ -1,0 +1,5 @@
+1. download and install python
+2. install ffmpeg:
+   in cmd: winget install ffmpeg
+           ffmpeg -version
+ 3. install requirements

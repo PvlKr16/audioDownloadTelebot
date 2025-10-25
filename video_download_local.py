@@ -33,6 +33,21 @@ def print_formats(video_formats, formats_blacklist):
     return available
 
 
+def get_unique_filename(base_dir, title, ext):
+    """Создает уникальное имя файла, если уже существует"""
+    safe_title = "".join(c if c.isalnum() or c in " -_()" else "_" for c in title)
+    filename = f"{safe_title}.{ext}"
+    filepath = os.path.join(base_dir, filename)
+
+    counter = 1
+    while os.path.exists(filepath):
+        filename = f"{safe_title} ({counter}).{ext}"
+        filepath = os.path.join(base_dir, filename)
+        counter += 1
+
+    return filepath
+
+
 def main():
     download_dir = "downloads_from_utube"
     os.makedirs(download_dir, exist_ok=True)
@@ -176,10 +191,13 @@ def main():
 
         print(f"\n⬇️ Спроба спампоўкі ({chosen_desc})...\n")
 
+        video_title = info.get("title", "video")
+        output_path = get_unique_filename(download_dir, video_title, "mp4")
+
         ydl_opts = {
             "format": format_string,
             "merge_output_format": "mp4",
-            "outtmpl": os.path.join(download_dir, "%(title)s.%(ext)s"),
+            "outtmpl": output_path,
             "noplaylist": True,
         }
 
